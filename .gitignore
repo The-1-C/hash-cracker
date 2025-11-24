@@ -1,3 +1,6 @@
+# Ignore scripts
+push_updates.bat
+
 # Ignore Database
 rainbow_db/
 rainbow.json
