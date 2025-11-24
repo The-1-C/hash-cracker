@@ -1,4 +1,7 @@
+use std::fs;
 use std::time::{Instant};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::thread;
 use sha1::{Sha1, Digest};
 use sha2::{Sha256};
 use md5::{Md5};
@@ -50,7 +53,7 @@ fn load_words_from_db(db: &sled::Db) -> Vec<String> {
 }
 
 fn main() {
-    let db_path = "../rainbow_db"; // Sled directory
+    let db_path = "../rainbow_db";
     println!("Opening Sled DB: {}", db_path);
     let db = open_db(db_path);
     
@@ -60,86 +63,125 @@ fn main() {
         println!("Warning: No words found in DB. Generator will revert to pure random mode.");
     }
     
-    // Try to recover previous count (slow) or just start count at 0 for session
     let initial_count = db.len();
     println!("DB currently has ~{} entries.", initial_count);
 
     let charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+}{\":?><-=[];',./";
-    let charset_chars: Vec<char> = charset.chars().collect();
-    let mut rng = thread_rng();
     
-    let mut count = 0;
+    // Shared counter for stats
+    let session_count = Arc::new(AtomicUsize::new(0));
     let start_time = Instant::now();
 
-    println!("Generating infinite SMART hashes. Press Ctrl+C to stop.");
+    println!("Generating infinite SMART hashes on ALL CORES. Press Ctrl+C to stop.");
 
-    loop {
-        let candidate: String;
-        
-        // Decide strategy (Weighted probability)
-        let strategy = rng.gen_range(0..100);
-        
-        if !words.is_empty() && strategy < 70 {
-            // 70% Chance: Smart Mutation using Wordlist
-            let word = &words[rng.gen_range(0..words.len())];
-            let sub_strat = rng.gen_range(0..4);
+    // Detect CPU cores
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    println!("Spawning {} worker threads...", num_threads);
+
+    let words_arc = Arc::new(words);
+    let charset_arc = Arc::new(charset.to_string());
+
+    let mut handles = vec![];
+
+    for _ in 0..num_threads {
+        let db_clone = db.clone();
+        let words_clone = words_arc.clone();
+        let charset_clone = charset_arc.clone();
+        let counter_clone = session_count.clone();
+
+        let handle = thread::spawn(move || {
+            let charset_chars: Vec<char> = charset_clone.chars().collect();
+            let mut rng = thread_rng();
             
-            if sub_strat == 0 {
-                // Append Digits (e.g. password123)
-                candidate = format!("{}{}", word, rng.gen_range(0..9999));
-            } else if sub_strat == 1 {
-                // Append Symbol (e.g. password!)
-                let sym = charset_chars[rng.gen_range(52..charset_chars.len())]; // roughly symbols area
-                candidate = format!("{}{}", word, sym);
-            } else if sub_strat == 2 && words.len() > 1 {
-                // Combinator (e.g. adminpassword)
-                let word2 = &words[rng.gen_range(0..words.len())];
-                candidate = format!("{}{}", word, word2);
-            } else {
-                 // Capitalize + Digit
-                 let mut chars = word.chars();
-                 if let Some(first) = chars.next() {
-                     let cap_word = first.to_uppercase().collect::<String>() + chars.as_str();
-                     candidate = format!("{}{}", cap_word, rng.gen_range(0..999));
-                 } else {
-                     candidate = word.to_string();
-                 }
+            loop {
+                let candidate: String;
+                let tag: &str;
+                
+                // Decide strategy (Weighted probability)
+                // 80% Smart (if words exist), 20% Pure Random
+                let strategy = rng.gen_range(0..100);
+                
+                if !words_clone.is_empty() && strategy < 80 {
+                    // SMART MODE
+                    let word = &words_clone[rng.gen_range(0..words_clone.len())];
+                    let sub_strat = rng.gen_range(0..100);
+                    
+                    if sub_strat < 40 {
+                        // 40% Chance: Digits (password123)
+                        candidate = format!("{}{}", word, rng.gen_range(0..9999));
+                        tag = "smart_digit";
+                    } else if sub_strat < 60 {
+                        // 20% Chance: Symbol (password!)
+                        let sym = charset_chars[rng.gen_range(52..charset_chars.len())]; 
+                        candidate = format!("{}{}", word, sym);
+                        tag = "smart_symbol";
+                    } else if sub_strat < 90 && words_clone.len() > 1 {
+                        // 30% Chance: Combinator (adminpassword) - INCREASED PRIORITY
+                        let word2 = &words_clone[rng.gen_range(0..words_clone.len())];
+                        // Random separator sometimes
+                        if rng.gen_bool(0.2) {
+                            candidate = format!("{}_{}", word, word2);
+                        } else {
+                             candidate = format!("{}{}", word, word2);
+                        }
+                        tag = "combinator";
+                    } else {
+                         // 10% Chance: Capitalize + Digit
+                         let mut chars = word.chars();
+                         if let Some(first) = chars.next() {
+                             let cap_word = first.to_uppercase().collect::<String>() + chars.as_str();
+                             candidate = format!("{}{}", cap_word, rng.gen_range(0..999));
+                         } else {
+                             candidate = word.to_string();
+                         }
+                         tag = "smart_cap";
+                    }
+                } else {
+                    // PURE RANDOM MODE
+                    let len = rng.gen_range(4..=12);
+                    candidate = (0..len)
+                        .map(|_| charset_chars[rng.gen_range(0..charset_chars.len())])
+                        .collect();
+                    tag = "random";
+                }
+
+                // Compute hashes
+                let h_md5 = hash_md5(&candidate);
+                let h_sha1 = hash_sha1(&candidate);
+                let h_sha256 = hash_sha256(&candidate);
+
+                // Store with metadata tag
+                let value_with_tag = format!("{}|{}", candidate, tag);
+
+                // Add to DB
+                let mut added = false;
+                
+                if !db_clone.contains_key(&h_md5).unwrap_or(false) { 
+                    let _ = db_clone.insert(&h_md5, value_with_tag.as_str()); 
+                    added = true; 
+                }
+                if !db_clone.contains_key(&h_sha1).unwrap_or(false) { 
+                    let _ = db_clone.insert(&h_sha1, value_with_tag.as_str()); 
+                    added = true; 
+                }
+                if !db_clone.contains_key(&h_sha256).unwrap_or(false) { 
+                    let _ = db_clone.insert(&h_sha256, value_with_tag.as_str()); 
+                    added = true; 
+                }
+
+                if added {
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                }
             }
-        } else {
-            // 30% Chance (or if empty): Pure Random (Fallback)
-            let len = rng.gen_range(4..=12);
-            candidate = (0..len)
-                .map(|_| charset_chars[rng.gen_range(0..charset_chars.len())])
-                .collect();
-        }
+        });
+        handles.push(handle);
+    }
 
-        // Compute hashes
-        let h_md5 = hash_md5(&candidate);
-        let h_sha1 = hash_sha1(&candidate);
-        let h_sha256 = hash_sha256(&candidate);
-
-        // Add to DB
-        let mut added = false;
-        
-        if !db.contains_key(&h_md5).unwrap_or(false) { 
-            let _ = db.insert(&h_md5, candidate.as_str()); 
-            added = true; 
-        }
-        if !db.contains_key(&h_sha1).unwrap_or(false) { 
-            let _ = db.insert(&h_sha1, candidate.as_str()); 
-            added = true; 
-        }
-        if !db.contains_key(&h_sha256).unwrap_or(false) { 
-            let _ = db.insert(&h_sha256, candidate.as_str()); 
-            added = true; 
-        }
-
-        if added {
-            count += 1;
-        }
-        
-        if count % 100 == 0 {
-            print!("\rSession Generated: {} | Speed: {:.0} hash/s   ", count, count as f64 / start_time.elapsed().as_secs_f64().max(1.0));
-        }
+    // Monitor Thread
+    loop {
+        thread::sleep(std::time::Duration::from_millis(500));
+        let count = session_count.load(Ordering::Relaxed);
+        let elapsed = start_time.elapsed().as_secs_f64().max(1.0);
+        print!("\rSession Generated: {} | Speed: {:.0} hash/s   ", count, count as f64 / elapsed);
     }
 }

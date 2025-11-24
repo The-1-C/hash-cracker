@@ -108,14 +108,17 @@ fn sync_wordlist_to_db(db: &sled::Db, wordlist_path: &str) {
         let h_sha1 = hash_string(Algo::Sha1, &word);
         let h_sha256 = hash_string(Algo::Sha256, &word);
 
+        // Store with "imported" tag
+        let val = format!("{}|imported", word);
+
         if !db.contains_key(&h_md5).unwrap_or(false) {
-             let _ = db.insert(&h_md5, word.as_str()); count += 1; 
+             let _ = db.insert(&h_md5, val.as_str()); count += 1; 
         }
         if !db.contains_key(&h_sha1).unwrap_or(false) {
-             let _ = db.insert(&h_sha1, word.as_str()); count += 1; 
+             let _ = db.insert(&h_sha1, val.as_str()); count += 1; 
         }
         if !db.contains_key(&h_sha256).unwrap_or(false) {
-             let _ = db.insert(&h_sha256, word.as_str()); count += 1; 
+             let _ = db.insert(&h_sha256, val.as_str()); count += 1; 
         }
     }
     
