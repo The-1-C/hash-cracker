@@ -1,5 +1,5 @@
-use std::fs::{self, File};
-use std::io::{self, BufRead, Write};
+use std::fs::File;
+use std::io::{self, BufRead};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use sha1::{Sha1, Digest};
@@ -48,7 +48,12 @@ fn detect_algo(hash: &str) -> Option<Algo> {
 // --- SLED DB FUNCTIONS ---
 
 fn open_db(path: &str) -> sled::Db {
-    sled::open(path).expect("Failed to open Sled DB")
+    sled::Config::default()
+        .path(path)
+        .cache_capacity(1024 * 1024 * 1024) // 1GB Cache
+        .mode(sled::Mode::HighThroughput)   // Optimize for speed
+        .open()
+        .expect("Failed to open Sled DB")
 }
 
 fn lookup_db(db: &sled::Db, hash: &str) -> Option<String> {
@@ -126,13 +131,6 @@ fn sync_wordlist_to_db(db: &sled::Db, wordlist_path: &str) {
 
 // --- CORE LOGIC ---
 
-fn append_to_wordlist(pwd: &str, path: &str) {
-    // Simple append
-    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-        let _ = writeln!(file, "{}", pwd);
-    }
-}
-
 fn load_wordlist(path: &str) -> Vec<String> {
     let mut words = Vec::new();
     if let Ok(file) = File::open(path) {
@@ -150,6 +148,46 @@ fn load_wordlist(path: &str) -> Vec<String> {
 
 fn brute_force(_algo: Algo, _target: &str, _charset: &str, _max_len: usize) -> Option<String> {
     None
+}
+
+fn combinator_attack(algo: Algo, target: &str, words: &[String]) -> Option<String> {
+    // Try every word combined with every other word (O(N^2))
+    // parallelize outer loop
+    let found = Arc::new(Mutex::new(None::<String>));
+    let chunk_size = 100; // words per thread chunk
+
+    let _ = thread::scope(|s| {
+        for chunk in words.chunks(chunk_size) {
+            let found_clone = found.clone();
+            let target = target.to_string();
+            let chunk = chunk.to_vec();
+            let all_words = words.to_vec(); // Each thread needs read access to full list
+
+            s.spawn(move |_| {
+                if found_clone.lock().unwrap().is_some() { return; }
+                
+                for w1 in chunk {
+                    for w2 in &all_words {
+                        // Try w1 + w2
+                        let candidate = format!("{}{}", w1, w2);
+                        if hash_string(algo, &candidate) == target {
+                            *found_clone.lock().unwrap() = Some(candidate); return;
+                        }
+                        // Try w2 + w1
+                        let candidate_rev = format!("{}{}", w2, w1);
+                        if hash_string(algo, &candidate_rev) == target {
+                             *found_clone.lock().unwrap() = Some(candidate_rev); return;
+                        }
+                        
+                        if found_clone.lock().unwrap().is_some() { return; }
+                    }
+                }
+            });
+        }
+    });
+    
+    let res = found.lock().unwrap().clone();
+    res
 }
 
 fn hybrid_attack(algo: Algo, target: &str, words: &[String]) -> Option<String> {
@@ -228,6 +266,12 @@ fn main() {
     println!("Opening Sled DB...");
     let db = open_db(db_path);
     
+    // Report stats
+    let total_hashes = db.len();
+    let smart_words = load_words_from_db(&db).len();
+    println!("Stats: {} total hashes in Rainbow Table.", total_hashes);
+    println!("Stats: {} smart words in Library for Hybrid attacks.", smart_words);
+
     // Sync DB with Wordlist
     sync_wordlist_to_db(&db, wordlist_file);
     
@@ -272,13 +316,37 @@ fn main() {
 
         if let Some(pwd) = hybrid_attack(algo, hash, &words) {
              println!("FOUND: {}", pwd);
-             // Save to DB
              insert_db(&db, hash, &pwd);
-             save_word_to_db(&db, &pwd); // Also save as a new base word
+             save_word_to_db(&db, &pwd);
              continue;
         }
 
-        println!("Failed to crack with current rules.");
+        // 3. Combinator Attack (Word + Word)
+        println!("Starting Combinator Attack (Word + Word)...");
+        // Only run if we have words, and limit count to avoid massive waits on huge DBs
+        if !words.is_empty() && words.len() < 5000 { 
+             if let Some(pwd) = combinator_attack(algo, hash, &words) {
+                 println!("FOUND: {}", pwd);
+                 insert_db(&db, hash, &pwd);
+                 save_word_to_db(&db, &pwd);
+                 continue;
+             }
+        } else if words.len() >= 5000 {
+            println!("  (Skipping combinator: wordlist too large (>5000) for O(N^2) check)");
+        }
+
+        // 4. Pure Brute Force (Random chars)
+        println!("Starting Pure Brute Force (Fallback)...");
+        // Lowercase + Digits (1-7 chars) - Extended to 7 for deeper search
+        let charset = "abcdefghijklmnopqrstuvwxyz0123456789";
+        if let Some(pwd) = brute_force(algo, hash, charset, 7) {
+             println!("FOUND: {}", pwd);
+             insert_db(&db, hash, &pwd);
+             save_word_to_db(&db, &pwd);
+             continue;
+        }
+
+        println!("Failed to crack with all methods.");
         println!("Time elapsed: {:.2?}", start.elapsed());
     }
 }
