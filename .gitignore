@@ -1,0 +1,19 @@
+# Ignore Database
+rainbow_db/
+rainbow.json
+*.db
+
+# Ignore Agents file
+AGENTS.md
+
+# Ignore Rust build artifacts
+target/
+**/*.rs.bk
+
+# Ignore Python cache (old stuff)
+__pycache__/
+*.pyc
+
+# Ignore IDE files
+.vscode/
+.idea/
